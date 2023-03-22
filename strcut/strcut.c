@@ -54,12 +54,12 @@ uint8_t strcut(char *str, char *findstr, char endchar)
 
 int main(void)
 {
-  //Example String that contains 'IPD,n,n:' this String must removed.
-  static char strx[] = ":010010121221321ACACACIPD,0,123::01009800BCD...";
+  	//Example String that contains 'IPD,n,n:' this String must removed.
+  	static char strx[] = ":010010121221321ACACACIPD,0,123::01009800BCD...";
 	
 	strcut(strx, "IPD,", ':');
 	printf("Result: %s\r\n", strx);
-  //Result: :010010121221321ACACAC:0100989ABCD...
+	//Result: :010010121221321ACACAC:0100989ABCD...
   
-  return 0;
+	return 0;
 }
