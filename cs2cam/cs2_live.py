@@ -135,6 +135,38 @@ CH_VIDEO = 1
 CH_AUDIO = 2
 
 JSON_PREAMBLE = bytes.fromhex("060aa080")
+
+# JSON command numbers (devbis/aiopppp const.py JsonCommands)
+CMD_SET_CYPUSH = 1
+CMD_CHECK_USER = 100
+CMD_GET_PARMS = 101
+CMD_DEV_CONTROL = 102       # lamp=0/1, icut=0/1, heart=1, reboot=1
+CMD_GET_ALARM = 107
+CMD_SET_ALARM = 108
+CMD_STREAM = 111
+CMD_SET_DATETIME = 126
+CMD_PTZ_CONTROL = 128
+CMD_SET_WHITELIGHT = 304    # status=0/1
+CMD_GET_WHITELIGHT = 305
+JSON_NAMES = {
+    CMD_SET_CYPUSH: "set_cypush", CMD_CHECK_USER: "check_user",
+    CMD_GET_PARMS: "get_parms", CMD_DEV_CONTROL: "dev_control",
+    CMD_GET_ALARM: "get_alarm", CMD_SET_ALARM: "set_alarm",
+    CMD_STREAM: "stream", CMD_SET_DATETIME: "set_datetime",
+    CMD_PTZ_CONTROL: "ptz_control", CMD_SET_WHITELIGHT: "set_whiteLight",
+    CMD_GET_WHITELIGHT: "get_whiteLight",
+}
+PUSH_PORT = 9093            # port the official app configures via set_cypush
+
+HELP = """commands (type + Enter while streaming):
+  led on|off           status LED            (dev_control lamp=1/0)
+  ir on|off|toggle     infrared night mode   (dev_control icut=1/0)
+  light on|off         white light, if any   (set_whiteLight status=1/0)
+  parms                read camera parameters (get_parms)
+  alarm                read motion-alarm settings (get_alarm)
+  raw {json}           send any JSON command, e.g. raw {"pro":"get_alarm","cmd":107}
+  reboot               reboot camera
+  help"""
 VIDEO_MARKER = b"\x55\xaa\x15\xa8"
 VIDEO_HEADER_LEN = 0x20
 
@@ -363,6 +395,14 @@ class Session:
         self.frames = 0
         self.logged_in = False
         self.streaming = False
+        self.params = {}            # last get_parms reply
+        # cmds we sent and expect a reply to; anything else arriving on
+        # channel 0 is reported as an unsolicited EVENT (e.g. motion alarm).
+        # set_datetime (126) is answered as cmd 128 (aiopppp const.py).
+        self.requested = {CMD_PTZ_CONTROL}
+        self.seen_cmd_idx = []      # recent channel-0 idx (camera retransmits)
+        self.console = queue.Queue()
+        self.startup_cmds = []      # commands from the command line
 
     # --- low level -----------------------------------------------------
     def send(self, plain, addr=None):
@@ -403,6 +443,7 @@ class Session:
         records = b""
         for o in objs:
             o = {**o, "user": USERNAME, "pwd": PASSWORD}
+            self.requested.add(o.get("cmd"))
             records += json_record(o)
             log("-> JSON", o)
         idx = self.out_idx
@@ -449,11 +490,11 @@ class Session:
 
     def on_drw(self, ch, idx, payload):
         if ch == CH_CMD:
+            if idx in self.seen_cmd_idx:
+                return
+            self.seen_cmd_idx = self.seen_cmd_idx[-63:] + [idx]
             for obj in parse_json_records(payload):
-                log("<- JSON", obj)
-                if obj.get("cmd") == 100 and not self.logged_in:
-                    self.logged_in = True
-                    self.start_stream()
+                self.on_json(obj)
         elif ch == CH_VIDEO:
             if payload.startswith(VIDEO_MARKER) and self.frames < 3:
                 log("frame header:", payload[:VIDEO_HEADER_LEN].hex(),
@@ -463,6 +504,88 @@ class Session:
                 if self.frames % 25 == 1:
                     log(f"frame #{self.frames}: {len(frame)} bytes")
                 self.player.push(frame)
+
+    def on_json(self, obj):
+        cmd = obj.get("cmd")
+        if cmd in self.requested:
+            log("<- JSON", obj)
+        else:
+            # not a reply to anything we asked -- camera-initiated message
+            print(f"[{time.strftime('%H:%M:%S')}] *** EVENT from camera: {obj}", flush=True)
+        if cmd == CMD_CHECK_USER and not self.logged_in:
+            self.logged_in = True
+            self.start_stream()
+        elif cmd == CMD_GET_PARMS and obj.get("result", 0) == 0:
+            self.params.update({k: v for k, v in obj.items() if k not in ("cmd", "result")})
+            print("camera parameters:", self.params, flush=True)
+        elif "result" in obj and obj["result"] != 0:
+            print(f"command {JSON_NAMES.get(cmd, cmd)} failed: {obj}", flush=True)
+
+    # --- camera controls -----------------------------------------------
+    def control(self, **kw):
+        self.send_json({"pro": "dev_control", "cmd": CMD_DEV_CONTROL, **kw})
+
+    def set_led(self, on):
+        self.control(lamp=int(on))
+        self.params["lamp"] = int(on)
+
+    def set_ir(self, on):
+        self.control(icut=int(on))
+        self.params["icut"] = int(on)
+
+    def set_whitelight(self, on):
+        self.send_json({"pro": "set_whiteLight", "cmd": CMD_SET_WHITELIGHT, "status": int(on)})
+
+    def do_command(self, line):
+        words = line.strip().split(None, 1)
+        if not words:
+            return
+        name, arg = words[0].lower(), (words[1].strip().lower() if len(words) > 1 else "")
+        on = {"on": True, "1": True, "an": True, "off": False, "0": False, "aus": False}.get(arg)
+        if name == "led" and on is not None:
+            self.set_led(on)
+        elif name == "ir" and (on is not None or arg == "toggle"):
+            if on is None:
+                on = not self.params.get("icut", 0)
+            self.set_ir(on)
+        elif name == "light" and on is not None:
+            self.set_whitelight(on)
+        elif name == "parms":
+            self.send_json({"pro": "get_parms", "cmd": CMD_GET_PARMS})
+        elif name == "alarm":
+            self.send_json({"pro": "get_alarm", "cmd": CMD_GET_ALARM})
+        elif name == "pushhere":
+            self.push_to_self()
+        elif name == "reboot":
+            self.control(reboot=1)
+        elif name == "raw" and arg:
+            try:
+                self.send_json(json.loads(words[1]))
+            except ValueError as e:
+                print("invalid JSON:", e)
+        else:
+            print(HELP)
+
+    def push_to_self(self):
+        """Tell the camera to send its alarm pushes (motion) to this PC.
+        The official app sends set_cypush with its cloud server on every
+        connect, so the app restores the original target next time it is
+        used."""
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect((CAMERA_IP, 1))
+        my_ip = probe.getsockname()[0]
+        probe.close()
+        self.send_json({"pro": "set_cypush", "cmd": CMD_SET_CYPUSH,
+                        "pushIp": my_ip, "pushPort": PUSH_PORT, "pushInterval": 180,
+                        "cyAdmin": "admin", "cyPwd": "admin", "cyToken": "local",
+                        "isPushPic": 1, "isPushVideo": 0})
+
+    def start_console(self):
+        def reader():
+            for line in sys.stdin:
+                self.console.put(line)
+        threading.Thread(target=reader, daemon=True).start()
+        print(HELP)
 
     # --- application flow (mirrors the official app's capture) ---------
     def login(self):
@@ -476,12 +599,15 @@ class Session:
         self.send_json({"pro": "stream", "cmd": 111, "video": 1, "camsmode": 0},
                        {"pro": "get_parms", "cmd": 101})
         self.streaming = True
+        for line in self.startup_cmds:
+            self.do_command(line)
 
     def run(self):
         if not self.connect():
             print("Camera not found. Are you connected to the camera's WiFi?")
             return
         self.login()
+        self.start_console()
         login_sent = last_alive = last_heart = time.time()
         try:
             while not self.player.exited():
@@ -496,6 +622,9 @@ class Session:
                     except (BlockingIOError, ConnectionResetError, OSError):
                         dec = None
                 self.flush_acks()
+
+                while not self.console.empty():
+                    self.do_command(self.console.get())
 
                 now = time.time()
                 self.resend_unacked(now)
@@ -522,6 +651,55 @@ class Session:
             self.sock.close()
             self.player.close()
             print(f"Stopped after {self.frames} frames.")
+
+
+def start_push_listener(port):
+    """Logs whatever the camera sends to the push target (TCP and UDP),
+    and saves embedded JPEG snapshots."""
+    def handle(data, src, proto):
+        print(f"[{time.strftime('%H:%M:%S')}] *** PUSH ({proto} from {src}) "
+              f"{len(data)} bytes: {data[:200]!r}", flush=True)
+        start = data.find(b"\xff\xd8")
+        if start >= 0:
+            path = os.path.join(OUT_DIR, time.strftime("motion_%Y%m%d_%H%M%S.jpg"))
+            with open(path, "wb") as f:
+                f.write(data[start:])
+            print("    snapshot saved:", path, flush=True)
+
+    def udp():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("0.0.0.0", port))
+        while True:
+            data, src = s.recvfrom(65536)
+            handle(data, src, "udp")
+
+    def tcp_client(conn, src):
+        conn.settimeout(5)
+        buf = b""
+        try:
+            while True:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        except OSError:
+            pass
+        conn.close()
+        if buf:
+            handle(buf, src, "tcp")
+
+    def tcp():
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", port))
+        s.listen(5)
+        while True:
+            conn, src = s.accept()
+            threading.Thread(target=tcp_client, args=(conn, src), daemon=True).start()
+
+    for fn in (udp, tcp):
+        threading.Thread(target=fn, daemon=True).start()
+    log(f"push listener on tcp/udp port {port}")
 
 
 # ---------------------------------------------------------------------------
@@ -566,8 +744,21 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--ip", default=CAMERA_IP)
+    ap.add_argument("--led", choices=["on", "off"], help="set status LED after login")
+    ap.add_argument("--ir", choices=["on", "off"], help="set infrared mode after login")
+    ap.add_argument("--push-listen", action="store_true",
+                    help="EXPERIMENTAL: point the camera's alarm push (set_cypush) "
+                         f"at this PC and log what arrives on port {PUSH_PORT}")
     args = ap.parse_args()
     CAMERA_IP = args.ip
     if args.selftest:
         sys.exit(0 if selftest() else 1)
-    Session().run()
+    session = Session()
+    if args.led:
+        session.startup_cmds.append("led " + args.led)
+    if args.ir:
+        session.startup_cmds.append("ir " + args.ir)
+    if args.push_listen:
+        start_push_listener(PUSH_PORT)
+        session.startup_cmds.append("pushhere")
+    session.run()

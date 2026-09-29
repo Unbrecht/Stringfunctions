@@ -57,3 +57,45 @@ Aufruf: `python3 cs2_live.py` (optional `--ip 192.168.10.1`).
    (Längenpräfix statt Startcodes). Den geloggten Hex-Dump prüfen.
 3. `dev_control/heart` wird alle 10 s wiederholt. Ob das nötig ist, ist
    unbestätigt (`HEART_INTERVAL`).
+
+## Steuerbefehle (LED, Infrarot) und Motion
+
+Die Befehlsnummern stammen aus devbis/aiopppp (`JsonCommands`, `JsonSession`),
+das dieselbe Kamerafamilie unterstützt:
+
+| Eingabe während des Streams | gesendetes JSON |
+|---|---|
+| `led on` / `led off` | `{"pro":"dev_control","cmd":102,"lamp":1/0}` |
+| `ir on` / `ir off` / `ir toggle` | `{"pro":"dev_control","cmd":102,"icut":1/0}` |
+| `light on` / `light off` | `{"pro":"set_whiteLight","cmd":304,"status":1/0}` |
+| `parms` | `get_parms` (101), enthält u. a. `lamp`, `icut`, `isShowIcutAuto` |
+| `alarm` | `get_alarm` (107): Bewegungsalarm-Einstellungen |
+| `raw {...}` | beliebiges JSON zum Ausprobieren |
+
+Beim Start per Kommandozeile: `python3 cs2_live.py --led off --ir on`.
+
+`ir toggle` nimmt den letzten bekannten `icut`-Wert aus `get_parms`.
+`lamp` ist laut Feldname die Status-LED. aiopppp verknüpft seinen
+„toggle-lamp“-Knopf allerdings mit `set_whiteLight`. Wenn `led off` die LED
+nicht ausschaltet, `light off` probieren.
+
+### Motion-Meldungen
+
+Über die P2P-Verbindung ist keine Motion-Meldung dokumentiert. Die App
+richtet mit `set_cypush` (Server `47.236.56.179:9093`, `isPushPic:1`) einen
+Cloud-Push ein, darüber laufen die Alarme. Zwei Wege sind eingebaut:
+
+1. **Unaufgeforderte Nachrichten:** Jede JSON-Nachricht auf Kanal 0, die keine
+   Antwort auf eine eigene Anfrage ist, wird als `*** EVENT from camera`
+   ausgegeben. Falls die Kamera Alarme auch an verbundene Clients schickt,
+   erscheinen sie hier.
+2. **`--push-listen` (experimentell):** schickt `set_cypush` mit der IP dieses
+   PCs und lauscht auf TCP/UDP 9093. Alles, was ankommt, wird geloggt,
+   enthaltene JPEGs landen als `motion_*.jpg`. Die App sendet bei jedem
+   Verbinden wieder ihren eigenen `set_cypush`. Dadurch werden die
+   App-Benachrichtigungen wiederhergestellt, und dieser Modus muss neu
+   aktiviert werden.
+
+Ob Bewegungserkennung eingeschaltet ist, zeigt `alarm`. Die Feldnamen der
+Antwort sind nicht dokumentiert. Zum Ändern die Antwort als Vorlage nehmen und
+mit `raw {"pro":"set_alarm","cmd":108,...}` zurückschicken.
