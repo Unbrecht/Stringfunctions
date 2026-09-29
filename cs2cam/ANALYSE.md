@@ -1,0 +1,59 @@
+# CS2/PPPP-Kamera (EEE-…, CY365/365Cam) – Analyse
+
+## Ursache: falscher Schlüssel
+
+Der effektive 4-Byte-Schlüssel im alten Skript war `3c c4 66 2e` (aus
+`SESSION_KEY 3103331d2f1a340635`). Richtig ist **`3c c4 68 0a`**. Ermittelt habe
+ich ihn aus den im Skript eingebetteten App-Paketen: Für jedes Schlüsselbyte `j`
+gibt es nur einen Wert, bei dem alle Bytes, deren vorheriges Chiffrat-Byte
+`& 3 == j` ist, zu lesbarem JSON werden.
+
+Mit dem falschen Schlüssel wird ungefähr jedes zweite Byte falsch ver- und
+entschlüsselt. Daraus erklären sich alle bisher beobachteten „Eigenheiten“:
+
+| Beobachtung im alten Skript | Tatsächlich (richtiger Schlüssel) |
+|---|---|
+| cmd `0xDE` / `0xDF` / `0xEE` / `0x4C` / `0xFE`, „Offset 0x0E“ | Standard-PPPP `0xD0` Drw, `0xD1` DrwAck, `0xE0` Alive, `0x42` P2pRdy, `0xF0` Close |
+| Längenfeld „unzuverlässig“ (158, 20756) | Längenfeld stimmt immer (`f1 e0 00 00`) |
+| keine H.264-Startcodes, unklare Fragment-Header | Nutzdaten waren teilweise falsch entschlüsselt |
+| selbst gebaute JSON-/ACK-Pakete ohne Wirkung | kamen bei der Kamera als Datenmüll an |
+| `LAN_SEARCH` unverschlüsselt, daher Port-Scan nötig | muss ebenfalls verschlüsselt gesendet werden |
+| Replays funktionieren „manchmal“ | Replays tragen alte `cmd_idx`-Werte, frische Befehle mit gleichem idx wurden als Duplikat verworfen |
+
+## Entschlüsselte App-Pakete (Login-Ablauf der App)
+
+```
+idx 0  {"pro":"check_user","cmd":100,"devmac":"0000","user":"admin","pwd":"6666"}
+idx 1  {"pro":"set_datetime","cmd":126,...,"time":1790250653,"tz":-3600}
+idx 2  get_attribute(103) + set_cypush(1)   (Cloud-Push, für Live-View unnötig)
+idx 3  {"pro":"dev_control","cmd":102,"heart":1}
+idx 4  {"pro":"stream","cmd":111,"video":1,"camsmode":0} + get_vol(134) + get_parms(101)
+idx 5  {"pro":"get_cloudsupport","cmd":9000}
+```
+Hinweis: `set_cypush` enthält einen Cloud-Token (`cyToken`) und Push-Server-Daten.
+
+Das ehemals rätselhafte „d10a“-ACK ist ein normales DrwAck:
+`f1 d1 0008 | d1 01 0002 0652 0653` = Kanal 1 (Video), 2 Indizes.
+
+## Neues Skript `cs2_live.py`
+
+* korrekter Schlüssel, `--selftest` prüft ihn offline gegen die App-Pakete
+* Discovery: verschlüsseltes LAN_SEARCH → PunchPkt → P2pRdy (kein Port-Scan)
+* frische JSON-Befehle mit fortlaufendem `cmd_idx`, Wiederholung bis DrwAck
+* jedes Drw der Kamera wird (gebündelt) per DrwAck bestätigt, Alive → AliveAck
+* Video: Kanal 1, Frame beginnt mit `55 aa 15 a8` + 32-Byte-Header, Rest in
+  aufeinanderfolgenden idx; 16-Bit-Überlauf wird korrekt behandelt
+* Codec-Erkennung am ersten Frame (H.264 Annex-B oder MJPEG), ffplay startet
+  mit passendem `-f`, Rohdaten zusätzlich in `stream_dump.h264|mjpeg`
+
+Aufruf: `python3 cs2_live.py` (optional `--ip 192.168.10.1`).
+
+## Noch offen / beim ersten echten Test prüfen
+
+1. Die ersten 3 Frame-Header werden geloggt. Beginnen die Daten nach 32 Bytes
+   nicht mit `00 00 00 01` bzw. `ff d8`, stimmt `VIDEO_HEADER_LEN` für dieses
+   Modell nicht. Dann den Offset des Startcodes im Log ablesen.
+2. Falls `detect_codec` „unknown“ meldet, verwendet die Kamera AVCC
+   (Längenpräfix statt Startcodes). Den geloggten Hex-Dump prüfen.
+3. `dev_control/heart` wird alle 10 s wiederholt. Ob das nötig ist, ist
+   unbestätigt (`HEART_INTERVAL`).
