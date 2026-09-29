@@ -382,6 +382,26 @@ class Player:
 # Session
 # ---------------------------------------------------------------------------
 
+def _port_cache():
+    return os.path.join(OUT_DIR, ".last_session_port")
+
+
+def save_port(port):
+    try:
+        with open(_port_cache(), "w") as f:
+            f.write(f"{CAMERA_IP} {port}")
+    except OSError:
+        pass
+
+
+def load_port():
+    try:
+        with open(_port_cache()) as f:
+            ip, port = f.read().split()
+        return int(port) if ip == CAMERA_IP else None
+    except (OSError, ValueError):
+        return None
+
 if sys.platform == "win32":
     import ctypes
 
@@ -438,25 +458,84 @@ class Session:
 
     # --- connect -------------------------------------------------------
     def connect(self):
-        for attempt in range(5):
-            self.sock.sendto(cs2_encrypt(pkt(T_LAN_SEARCH)), (CAMERA_IP, DISCOVERY_PORT))
-            self.sock.sendto(cs2_encrypt(pkt(T_LAN_SEARCH)), ("255.255.255.255", DISCOVERY_PORT))
-            deadline = time.time() + 1.0
+        """1. LAN search on 32108 (broadcast + unicast)
+        2. PunchPkt to the session port remembered from the last run
+        3. PunchPkt to every port 1024-65535 (the camera still answers a
+           punch on its session port when it ignores LAN search, e.g. while
+           it thinks an old session is alive)"""
+        punch = cs2_encrypt(make_punch())
+        seen_any = False
+        own_port = self.sock.getsockname()[1]
+
+        def listen(seconds):
+            nonlocal seen_any
+            deadline = time.time() + seconds
             while time.time() < deadline:
                 dec, addr = self.recv(0.2)
-                if not dec or dec[0] != MAGIC:
+                if not dec:
                     continue
+                if addr[1] == own_port and dec == make_punch():
+                    continue        # our own scan packet looped back
+                if dec[0] != MAGIC:
+                    log(f"<- {addr} non-PPPP packet {dec[:16].hex()}")
+                    continue
+                seen_any = True
                 log(f"<- {addr} type=0x{dec[1]:02x} {dec[:24].hex()}")
-                if dec[1] == T_PUNCH and self.addr is None:
+                if dec[1] in (T_PUNCH, T_P2P_RDY) and self.addr is None:
                     self.addr = addr
                     log(f"camera session endpoint: {addr}")
-                    self.send(make_punch())
-                elif dec[1] == T_P2P_RDY and addr == self.addr:
+                    self.sock.sendto(punch, addr)
+                if dec[1] == T_P2P_RDY and addr == self.addr:
                     log("P2P ready")
+                    save_port(addr[1])
                     return True
+                if dec[1] == T_CLOSE:
+                    log("camera sent Close -- it may still be busy with an old session")
+            return False
+
+        for attempt in range(4):
+            for target in ((CAMERA_IP, DISCOVERY_PORT), ("255.255.255.255", DISCOVERY_PORT)):
+                try:
+                    self.sock.sendto(cs2_encrypt(pkt(T_LAN_SEARCH)), target)
+                except OSError as e:
+                    log(f"LAN search to {target} failed: {e}")
             if self.addr:
-                self.send(make_punch())
-        return self.addr is not None
+                self.sock.sendto(punch, self.addr)
+            if listen(1.0):
+                return True
+
+        port = load_port()
+        if port and not self.addr:
+            log(f"no answer to LAN search, trying last session port {port}")
+            for _ in range(3):
+                self.sock.sendto(punch, (CAMERA_IP, port))
+                if listen(0.7):
+                    return True
+
+        if not self.addr:
+            print(f"No answer to LAN search -- scanning {CAMERA_IP} ports 1024-65535 ...")
+            for p in range(1024, 65536):
+                try:
+                    self.sock.sendto(punch, (CAMERA_IP, p))
+                except OSError:
+                    pass
+                if p % 4096 == 0 and listen(0.05):
+                    return True
+        for _ in range(4):
+            if self.addr:
+                self.sock.sendto(punch, self.addr)
+            if listen(1.0):
+                return True
+
+        print("\nCamera not found." if not seen_any else
+              "\nCamera answered but the P2P handshake did not complete.")
+        print(f"""  - Is this PC still connected to the camera's WiFi? (ping {CAMERA_IP})
+    Battery cameras switch their WiFi off when idle: press the camera's
+    button / move in front of it, or plug it in, then reconnect the WiFi.
+  - Close the phone app and any other running instance of this script
+    (the camera may accept only one client at a time).
+  - Still nothing: power-cycle the camera.""")
+        return False
 
     # --- reliable command channel --------------------------------------
     def send_json(self, *objs):
