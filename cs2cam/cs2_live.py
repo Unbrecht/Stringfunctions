@@ -443,6 +443,7 @@ class Session:
         self.requested = {CMD_PTZ_CONTROL}
         self.seen_cmd_idx = []      # recent channel-0 idx (camera retransmits)
         self.cmd_buf = b""          # partial JSON record spanning Drw packets
+        self.cmd_buf_since = 0
         self.awaiting = {}          # cmd -> [[name, send time, reported], ...] (FIFO)
         self.reply_timeout = 3.0
         self.outq = []
@@ -648,9 +649,14 @@ class Session:
             self.seen_cmd_idx = self.seen_cmd_idx[-63:] + [idx]
             if DEBUG_CMD_CHANNEL:
                 log(f"ch0 idx={idx} len={len(payload)} raw:", payload[:64].hex())
+            if payload[:2] == JSON_PREAMBLE[:2] and self.cmd_buf:
+                # a new record starts -> the buffered one will never complete
+                self.flush_partial()
             records, self.cmd_buf = parse_json_records(self.cmd_buf + payload, keep_partial=True)
-            if len(self.cmd_buf) > 65536:
-                self.cmd_buf = b""
+            if self.cmd_buf:
+                self.cmd_buf_since = time.time()
+                if DEBUG_CMD_CHANNEL:
+                    log(f"holding partial ch0 record ({len(self.cmd_buf)} bytes)")
             for obj in records:
                 self.on_json(obj)
         elif ch == CH_VIDEO:
@@ -663,6 +669,19 @@ class Session:
                 if self.frames % 25 == 1:
                     log(f"frame #{self.frames}: {len(frame)} bytes")
                 self.player.push(frame)
+
+    def flush_partial(self):
+        """Deliver a buffered record that never completed. Seen causes: a
+        length field larger than the data actually sent. Without this, one
+        such record swallowed every later reply."""
+        buf, self.cmd_buf = self.cmd_buf, b""
+        raw = buf[8:].rstrip(b"\0").strip()
+        try:
+            obj = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            log("dropping incomplete ch0 record:", buf[:64].hex())
+            return
+        self.on_json(obj)
 
     def on_json(self, obj):
         cmd = obj.get("cmd")
@@ -814,6 +833,8 @@ class Session:
                     self.do_command(self.console.get())
 
                 now = time.time()
+                if self.cmd_buf and now - self.cmd_buf_since > 1.0:
+                    self.flush_partial()
                 self.resend_unacked(now)
                 self.check_replies(now)
                 if now - last_alive > KEEPALIVE_INTERVAL:
