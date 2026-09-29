@@ -325,15 +325,79 @@ def detect_codec(frame):
     return None
 
 
+def jpeg_info(frame):
+    """(width, height, sampling) from the JPEG SOF marker, or None."""
+    pos = 2
+    while pos + 4 <= len(frame):
+        if frame[pos] != 0xff:
+            return None
+        marker = frame[pos + 1]
+        if marker in (0xd8, 0x01) or 0xd0 <= marker <= 0xd7:
+            pos += 2
+            continue
+        seglen = struct.unpack(">H", frame[pos + 2:pos + 4])[0]
+        if marker in (0xc0, 0xc1, 0xc2) and pos + 10 <= len(frame):
+            h, w, ncomp = struct.unpack(">HHB", frame[pos + 5:pos + 10])
+            sampling = tuple(frame[pos + 11 + 3 * i] for i in range(ncomp)
+                             if pos + 11 + 3 * i < len(frame))
+            return w, h, sampling
+        if marker == 0xda:
+            return None
+        pos += 2 + seglen
+    return None
+
+
 class Player:
     """Starts ffplay lazily once the codec is known; writes via a thread so
-    a slow ffplay can never stall the network loop."""
+    a slow ffplay can never stall the network loop.
+
+    ffplay froze (while frames kept arriving) after the camera changed its
+    image orientation, so ffplay is restarted whenever the JPEG format
+    (size / chroma sampling) changes or ffplay stops consuming frames."""
+
+    STALL_QUEUE = 50            # frames queued for ffplay -> considered stuck
 
     def __init__(self):
         self.proc = None
         self.codec = None
-        self.q = queue.Queue(maxsize=300)
+        self.q = None
         self.dump = None
+        self.fmt = None
+        self.bad_frames = 0
+        self.restarting = False
+
+    def _start(self):
+        self.q = queue.Queue(maxsize=300)
+        try:
+            self.proc = subprocess.Popen(
+                ["ffplay", "-f", self.codec, "-fflags", "nobuffer",
+                 "-flags", "low_delay", "-framedrop", "-loglevel", "warning",
+                 "-window_title", "CS2 Camera - Live", "-i", "pipe:0"]
+                + (["-vf", VIEW_FILTERS[VIEW_ROTATE]] if VIEW_ROTATE else []),
+                stdin=subprocess.PIPE)
+        except FileNotFoundError:
+            log("ffplay not found -- only dumping to file")
+            self.proc = None
+            return
+        threading.Thread(target=self._writer, args=(self.proc, self.q), daemon=True).start()
+
+    def _restart(self, why):
+        log(f"restarting ffplay ({why})")
+        self.restarting = True
+        old, oldq = self.proc, self.q
+        if oldq:
+            try:
+                oldq.put_nowait(None)
+            except queue.Full:
+                pass
+        if old:
+            try:
+                old.kill()
+            except OSError:
+                pass
+            old.wait()
+        self._start()
+        self.restarting = False
 
     def push(self, frame):
         if self.codec is None:
@@ -344,37 +408,51 @@ class Player:
             path = os.path.join(OUT_DIR, "stream_dump." + self.codec)
             self.dump = open(path, "wb")
             log(f"codec detected: {self.codec}, dumping to {path}")
-            try:
-                self.proc = subprocess.Popen(
-                    ["ffplay", "-f", self.codec, "-fflags", "nobuffer",
-                     "-flags", "low_delay", "-framedrop", "-loglevel", "warning",
-                     "-window_title", "CS2 Camera - Live", "-i", "pipe:0"]
-                    + (["-vf", VIEW_FILTERS[VIEW_ROTATE]] if VIEW_ROTATE else []),
-                    stdin=subprocess.PIPE)
-                threading.Thread(target=self._writer, daemon=True).start()
-            except FileNotFoundError:
-                log("ffplay not found -- only dumping to file")
+            self._start()
+
+        if self.codec == "mjpeg":
+            end = frame.rfind(b"\xff\xd9")
+            if not frame.startswith(b"\xff\xd8") or end < 0:
+                self.bad_frames += 1
+                if self.bad_frames in (1, 10, 100) or self.bad_frames % 1000 == 0:
+                    log(f"dropped {self.bad_frames} incomplete JPEG frame(s)")
+                return
+            frame = frame[:end + 2]          # strip padding after EOI
+            fmt = jpeg_info(frame)
+            if fmt and fmt != self.fmt:
+                if self.fmt is not None:
+                    log(f"JPEG format changed {self.fmt} -> {fmt}")
+                    self._restart("format change")
+                else:
+                    log(f"JPEG format: {fmt[0]}x{fmt[1]}, sampling {fmt[2]}")
+                self.fmt = fmt
+
         self.dump.write(frame)
         self.dump.flush()
         if self.proc:
+            if self.q.qsize() > self.STALL_QUEUE:
+                self._restart("ffplay stopped reading")
             try:
                 self.q.put_nowait(frame)
             except queue.Full:
                 log("ffplay falling behind, frame dropped")
 
-    def _writer(self):
+    @staticmethod
+    def _writer(proc, q):
         while True:
-            item = self.q.get()
+            item = q.get()
             if item is None:
                 break
             try:
-                self.proc.stdin.write(item)
-                self.proc.stdin.flush()
-            except (BrokenPipeError, OSError):
+                proc.stdin.write(item)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
                 break
 
     def exited(self):
-        return self.proc is not None and self.proc.poll() is not None
+        """True when the user closed the ffplay window."""
+        return (self.proc is not None and not self.restarting
+                and self.proc.poll() is not None)
 
     def close(self):
         if self.dump:
