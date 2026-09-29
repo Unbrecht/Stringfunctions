@@ -158,3 +158,13 @@ Beobachtet an der echten Kamera:
 (Tagbetrieb, IR-LEDs aus), `0` = Nachtbetrieb. Ob `ir on` die IR-LEDs
 ein- oder ausschaltet, muss an der Kamera geprüft werden. Mit `ir 0`, `ir 1`
 und `ir 2` probieren und jeweils `parms` abfragen.
+
+**Korrektur (Log 13:41):** Nicht `stream`, sondern `get_parms` (101) blockiert
+die Befehlsverarbeitung. `check_user`, `set_datetime` und `heart` werden sofort
+beantwortet. Nach `get_parms` werden alle folgenden Befehle (`ir 0/1/2`,
+`alarm`, `parms`) zwar per DrwAck bestätigt, aber nie beantwortet. Im 12:48-Log
+kam die `get_parms`-Antwort nach 44 s, danach lief wieder alles.
+Vermutung: Für `server_ver`/`upgrade` fragt die Kamera einen Update-Server im
+Internet an und wartet im Kamera-WLAN (ohne Internet) auf den Timeout.
+`get_parms` wird deshalb nicht mehr automatisch gesendet, nur noch mit `parms`
+(mit Warnhinweis).

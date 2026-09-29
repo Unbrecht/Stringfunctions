@@ -167,7 +167,7 @@ HELP = """commands (type + Enter while streaming):
   ir on|off|toggle     infrared night mode   (dev_control icut=1/0)
   ir <n>               raw icut value (e.g. 2 -- camera reports isShowIcutAuto)
   light on|off         white light, if any   (set_whiteLight status=1/0)
-  parms                read camera parameters (get_parms)
+  parms                read camera parameters (get_parms) -- may block camera ~40 s
   alarm                read motion-alarm settings (get_alarm)
   raw {json}           send any JSON command, e.g. raw {"pro":"get_alarm","cmd":107}
   stream               (re)request the video stream
@@ -719,6 +719,8 @@ class Session:
         elif name == "light" and on is not None:
             self.set_whitelight(on)
         elif name == "parms":
+            print("note: get_parms can block this camera's command handling for "
+                  "40 s or more -- other commands wait until it answers", flush=True)
             self.send_json({"pro": "get_parms", "cmd": CMD_GET_PARMS})
         elif name == "alarm":
             self.send_json({"pro": "get_alarm", "cmd": CMD_GET_ALARM})
@@ -772,7 +774,10 @@ class Session:
         # arrives (or FORCE_STREAM_CMD is set).
         if FORCE_STREAM_CMD:
             self.request_video()
-        self.send_json({"pro": "get_parms", "cmd": 101})
+        # get_parms is NOT sent automatically: on this camera it blocks the
+        # command handling (probably an upgrade-server lookup for
+        # server_ver/upgrade without internet) -- every later command
+        # (ir, led, ...) then sat in the camera's queue unanswered.
         self.streaming = True
         self.stream_started = time.time()
         for line in self.startup_cmds:
