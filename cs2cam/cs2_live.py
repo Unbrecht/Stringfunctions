@@ -70,8 +70,9 @@ OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 KEEPALIVE_INTERVAL = 1.0       # our own P2PAlive
 RESEND_INTERVAL = 0.5          # resend un-acked outgoing Drw packets
-HEART_INTERVAL = 0             # 0 = off. The app sends heart once; repeating it
-                               # every 10 s coincided with the camera stalling          # app sends dev_control/heart; repeated here
+HEART_INTERVAL = 30.0          # dev_control heart=1 (answered instantly). Off (0)
+                               # the stream ended after ~10 min in one test.
+CAMERA_SILENT = 10.0           # no packet at all for this long -> reconnect          # app sends dev_control/heart; repeated here
                                # as a stream keep-alive (semantics unconfirmed)
 
 # ---------------------------------------------------------------------------
@@ -507,6 +508,21 @@ else:
 
 class Session:
     def __init__(self):
+        self.sock = None
+        self.player = Player()
+        self.frames = 0
+        self.params = {}            # last get_parms reply
+        self.console = queue.Queue()
+        self.startup_cmds = []      # commands from the command line
+        self._reset_link()
+
+    def _reset_link(self):
+        """Fresh socket and protocol state (initial connect and reconnect)."""
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.bind(("0.0.0.0", 0))
@@ -516,11 +532,9 @@ class Session:
         self.unacked = {}           # idx -> (raw packet, last send time)
         self.pending_acks = {}      # channel -> [idx, ...]
         self.assembler = FrameAssembler()
-        self.player = Player()
-        self.frames = 0
         self.logged_in = False
         self.streaming = False
-        self.params = {}            # last get_parms reply
+        self.last_rx = time.monotonic()     # last packet of any kind from the camera
         # cmds we sent and expect a reply to; anything else arriving on
         # channel 0 is reported as an unsolicited EVENT (e.g. motion alarm).
         # set_datetime (126) is answered as cmd 128 (aiopppp const.py).
@@ -530,12 +544,10 @@ class Session:
         self.cmd_buf_since = 0
         self.awaiting = {}          # cmd -> [[name, send time, reported], ...] (FIFO)
         self.reply_timeout = 3.0
-        self.outq = []
+        self.outq = []              # queued command packets (lists of JSON objs)
         self.video_requested_at = 0
-        self.stream_started = 0              # queued command packets (lists of JSON objs)
+        self.stream_started = 0
         self.last_video = None      # time of the last video packet
-        self.console = queue.Queue()
-        self.startup_cmds = []      # commands from the command line
 
     # --- low level -----------------------------------------------------
     def send(self, plain, addr=None):
@@ -707,6 +719,7 @@ class Session:
     def handle(self, dec):
         if len(dec) < 4 or dec[0] != MAGIC:
             return
+        self.last_rx = time.monotonic()
         ptype = dec[1]
         body = dec[4:4 + struct.unpack(">H", dec[2:4])[0]]
         if ptype == T_ALIVE:
@@ -897,9 +910,22 @@ class Session:
 
     def request_video(self):
         self.video_requested_at = time.monotonic()
+        if any(o.get("cmd") == CMD_STREAM for objs in self.outq for o in objs):
+            return                  # one is already waiting in the queue
         self.outq.insert(0, [{"pro": "stream", "cmd": CMD_STREAM, "video": 1,
                               "camsmode": 0, "user": USERNAME, "pwd": PASSWORD}])
         self.pump()
+
+    def reconnect(self):
+        """Camera went silent (asleep, crashed, WiFi lost): start over.
+        The ffplay window stays open."""
+        while True:
+            self._reset_link()
+            print(f"[{time.strftime('%H:%M:%S')}] reconnecting ...", flush=True)
+            if self.connect():
+                self.login()
+                return
+            time.sleep(3)
 
     def run(self):
         if not self.connect():
@@ -910,6 +936,11 @@ class Session:
         login_sent = last_alive = last_heart = time.monotonic()
         try:
             while not self.player.exited():
+                if time.monotonic() - self.last_rx > CAMERA_SILENT:
+                    print(f"[{time.strftime('%H:%M:%S')}] camera silent for "
+                          f"{CAMERA_SILENT:.0f} s (asleep, crashed or WiFi lost)", flush=True)
+                    self.reconnect()
+                    login_sent = last_alive = last_heart = time.monotonic()
                 dec, addr = self.recv(0.05)
                 while dec is not None:
                     if addr == self.addr:

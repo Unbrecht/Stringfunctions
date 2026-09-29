@@ -186,3 +186,21 @@ Das funktioniert immer, ändert aber nicht die Bilder in der App oder in
 Nach einem Neustart der Kamera waren die langen Verzögerungen bei `icut` und
 `get_parms` verschwunden. Die Kamera war vorher offenbar in einem gestörten
 Zustand.
+
+## Abbruch nach ~10 Minuten (Log 14:41–14:51)
+
+Nach ~10 min stabilem Stream war die Kamera komplett stumm: keine Frames,
+keine Keepalives, nicht einmal eine Bestätigung (DrwAck) für den neuen
+`stream`-Befehl. Es kam auch kein Close-Paket. Mögliche Ursachen: Zeitlimit
+für die Live-Ansicht einer Akkukamera, Schlafmodus, Absturz oder WLAN-Abbruch.
+In diesem Lauf war das periodische `heart` abgeschaltet.
+
+Änderungen:
+
+* `heart` wird wieder alle 30 s gesendet (`HEART_INTERVAL = 30`). Die Kamera
+  beantwortet es sofort.
+* Kommt `CAMERA_SILENT` (10 s) lang kein Paket von der Kamera, baut das Skript
+  die Verbindung komplett neu auf (neues Socket, LAN-Suche, Login). Das
+  ffplay-Fenster bleibt offen, `--led`, `--ir` und `--rotate` werden erneut
+  angewendet.
+* `stream`-Anforderungen stapeln sich nicht mehr in der Warteschlange.
