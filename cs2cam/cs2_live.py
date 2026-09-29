@@ -478,8 +478,8 @@ class Session:
 
         def listen(seconds):
             nonlocal seen_any
-            deadline = time.time() + seconds
-            while time.time() < deadline:
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
                 dec, addr = self.recv(0.2)
                 if not dec:
                     continue
@@ -564,14 +564,17 @@ class Session:
                    for entries in self.awaiting.values() for e in entries)
 
     def pump(self):
-        now = time.time()
+        now = time.monotonic()
         if not self.outq or self.busy(now):
             return
         objs = self.outq.pop(0)
         records = b""
         for o in objs:
             self.requested.add(o.get("cmd"))
-            self.awaiting.setdefault(o.get("cmd"), []).append([o.get("pro"), now, False])
+            args = " ".join(f"{k}={v}" for k, v in o.items()
+                            if k not in ("pro", "cmd", "user", "pwd", "time", "tz"))
+            label = f"{o.get('pro')} {args}".strip()
+            self.awaiting.setdefault(o.get("cmd"), []).append([label, now, False])
             records += json_record(o)
             log("-> JSON", o)
         idx = self.out_idx
@@ -654,13 +657,13 @@ class Session:
                 self.flush_partial()
             records, self.cmd_buf = parse_json_records(self.cmd_buf + payload, keep_partial=True)
             if self.cmd_buf:
-                self.cmd_buf_since = time.time()
+                self.cmd_buf_since = time.monotonic()
                 if DEBUG_CMD_CHANNEL:
                     log(f"holding partial ch0 record ({len(self.cmd_buf)} bytes)")
             for obj in records:
                 self.on_json(obj)
         elif ch == CH_VIDEO:
-            self.last_video = time.time()
+            self.last_video = time.monotonic()
             if payload.startswith(VIDEO_MARKER) and self.frames < 3:
                 log("frame header:", payload[:VIDEO_HEADER_LEN].hex(),
                     "data:", payload[VIDEO_HEADER_LEN:VIDEO_HEADER_LEN + 16].hex())
@@ -688,7 +691,7 @@ class Session:
         pending = self.awaiting.get(CMD_SET_DATETIME if cmd == 128 else cmd)
         if pending:
             name, sent, reported = pending.pop(0)
-            delay = time.time() - sent
+            delay = time.monotonic() - sent
             if reported or delay > 2.0:
                 print(f"[{time.strftime('%H:%M:%S')}] late reply to '{name}' after "
                       f"{delay:.1f}s", flush=True)
@@ -798,12 +801,12 @@ class Session:
         # server_ver/upgrade without internet) -- every later command
         # (ir, led, ...) then sat in the camera's queue unanswered.
         self.streaming = True
-        self.stream_started = time.time()
+        self.stream_started = time.monotonic()
         for line in self.startup_cmds:
             self.do_command(line)
 
     def request_video(self):
-        self.video_requested_at = time.time()
+        self.video_requested_at = time.monotonic()
         self.outq.insert(0, [{"pro": "stream", "cmd": CMD_STREAM, "video": 1,
                               "camsmode": 0, "user": USERNAME, "pwd": PASSWORD}])
         self.pump()
@@ -814,7 +817,7 @@ class Session:
             return
         self.login()
         self.start_console()
-        login_sent = last_alive = last_heart = time.time()
+        login_sent = last_alive = last_heart = time.monotonic()
         try:
             while not self.player.exited():
                 dec, addr = self.recv(0.05)
@@ -832,7 +835,7 @@ class Session:
                 while not self.console.empty():
                     self.do_command(self.console.get())
 
-                now = time.time()
+                now = time.monotonic()
                 if self.cmd_buf and now - self.cmd_buf_since > 1.0:
                     self.flush_partial()
                 self.resend_unacked(now)
