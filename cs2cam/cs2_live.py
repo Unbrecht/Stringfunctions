@@ -64,6 +64,8 @@ PASSWORD = "6666"
 DEBUG = True
 DEBUG_CMD_CHANNEL = False      # log every raw channel-0 (command) packet
 FORCE_STREAM_CMD = False       # send 'stream' even if video already flows
+VIEW_ROTATE = 0                # rotate only the ffplay display: 0/90/180/270
+VIEW_FILTERS = {90: "transpose=clock", 180: "hflip,vflip", 270: "transpose=cclock"}
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 KEEPALIVE_INTERVAL = 1.0       # our own P2PAlive
@@ -167,6 +169,9 @@ HELP = """commands (type + Enter while streaming):
   ir on|off|toggle     infrared night mode   (dev_control icut=1/0)
   ir <n>               raw icut value (e.g. 2 -- camera reports isShowIcutAuto)
   light on|off         white light, if any   (set_whiteLight status=1/0)
+  rotate 0|1|2|3       image orientation in the camera (dev_control rotmir):
+                       0 normal, 1 mirror, 2 flip, 3 mirror+flip (= 180 deg)
+  set <key> <value>    any dev_control field, e.g. set bright 5, set contrast 3
   parms                read camera parameters (get_parms) -- may block camera ~40 s
   alarm                read motion-alarm settings (get_alarm)
   raw {json}           send any JSON command, e.g. raw {"pro":"get_alarm","cmd":107}
@@ -343,7 +348,8 @@ class Player:
                 self.proc = subprocess.Popen(
                     ["ffplay", "-f", self.codec, "-fflags", "nobuffer",
                      "-flags", "low_delay", "-framedrop", "-loglevel", "warning",
-                     "-window_title", "CS2 Camera - Live", "-i", "pipe:0"],
+                     "-window_title", "CS2 Camera - Live", "-i", "pipe:0"]
+                    + (["-vf", VIEW_FILTERS[VIEW_ROTATE]] if VIEW_ROTATE else []),
                     stdin=subprocess.PIPE)
                 threading.Thread(target=self._writer, daemon=True).start()
             except FileNotFoundError:
@@ -738,6 +744,12 @@ class Session:
             if on is None:
                 on = not self.params.get("icut", 0)
             self.set_ir(on)
+        elif name == "rotate" and arg in ("0", "1", "2", "3"):
+            self.control(rotmir=int(arg))
+            self.params["rotmir"] = int(arg)
+        elif name == "set" and len(arg.split()) == 2:
+            key, value = words[1].split()
+            self.control(**{key: int(value) if value.lstrip("-").isdigit() else value})
         elif name == "light" and on is not None:
             self.set_whitelight(on)
         elif name == "parms":
@@ -1067,6 +1079,10 @@ if __name__ == "__main__":
     ap.add_argument("--ip", default=CAMERA_IP)
     ap.add_argument("--led", choices=["on", "off"], help="set status LED after login")
     ap.add_argument("--ir", choices=["on", "off"], help="set infrared mode after login")
+    ap.add_argument("--rotate", choices=["0", "1", "2", "3"],
+                    help="set image orientation in the camera after login (rotmir)")
+    ap.add_argument("--view-rotate", type=int, choices=[0, 90, 180, 270], default=0,
+                    help="rotate only the ffplay display (works regardless of camera support)")
     ap.add_argument("--push-listen", action="store_true",
                     help="EXPERIMENTAL: point the camera's alarm push (set_cypush) "
                          f"at this PC and log what arrives on port {PUSH_PORT}")
@@ -1082,6 +1098,9 @@ if __name__ == "__main__":
         session.startup_cmds.append("led " + args.led)
     if args.ir:
         session.startup_cmds.append("ir " + args.ir)
+    if args.rotate:
+        session.startup_cmds.append("rotate " + args.rotate)
+    VIEW_ROTATE = args.view_rotate
     if args.push_listen:
         start_push_listener(PUSH_PORT)
         session.startup_cmds.append("pushhere")

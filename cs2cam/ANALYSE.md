@@ -70,6 +70,8 @@ das dieselbe Kamerafamilie unterstützt:
 | `light on` / `light off` | `{"pro":"set_whiteLight","cmd":304,"status":1/0}` |
 | `parms` | `get_parms` (101), enthält u. a. `lamp`, `icut`, `isShowIcutAuto` |
 | `alarm` | `get_alarm` (107): Bewegungsalarm-Einstellungen |
+| `rotate 0/1/2/3` | `{"pro":"dev_control","cmd":102,"rotmir":n}`: 0 normal, 1 gespiegelt, 2 gekippt, 3 beides (= 180°) |
+| `set <feld> <wert>` | beliebiges `dev_control`-Feld, z. B. `set bright 5`, `set contrast 3` |
 | `raw {...}` | beliebiges JSON zum Ausprobieren |
 
 Beim Start per Kommandozeile: `python3 cs2_live.py --led off --ir on`.
@@ -168,3 +170,19 @@ Vermutung: Für `server_ver`/`upgrade` fragt die Kamera einen Update-Server im
 Internet an und wartet im Kamera-WLAN (ohne Internet) auf den Timeout.
 `get_parms` wird deshalb nicht mehr automatisch gesendet, nur noch mit `parms`
 (mit Warnhinweis).
+
+## Bild drehen
+
+`get_parms` meldet `rotmir` (Rotation/Spiegelung). Bei `lamp` und `icut` ließ
+sich ein Feld aus `get_parms` per `dev_control` mit gleichem Namen setzen. Nach
+diesem Muster sendet `rotate n` den Wert `dev_control rotmir=n`. Die Werte 0–3
+entsprechen aiopppps `VideoRotate` (normal / H / V / H+V). Ob die Firmware sie
+genauso auslegt, ist an der Kamera zu prüfen. 90° kann der Sensor nicht.
+
+Unabhängig davon dreht `--view-rotate 90|180|270` nur die Anzeige in ffplay.
+Das funktioniert immer, ändert aber nicht die Bilder in der App oder in
+`stream_dump.mjpeg`.
+
+Nach einem Neustart der Kamera waren die langen Verzögerungen bei `icut` und
+`get_parms` verschwunden. Die Kamera war vorher offenbar in einem gestörten
+Zustand.
