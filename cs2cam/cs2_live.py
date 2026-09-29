@@ -63,11 +63,13 @@ USERNAME = "admin"
 PASSWORD = "6666"
 DEBUG = True
 DEBUG_CMD_CHANNEL = False      # log every raw channel-0 (command) packet
+FORCE_STREAM_CMD = False       # send 'stream' even if video already flows
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 KEEPALIVE_INTERVAL = 1.0       # our own P2PAlive
 RESEND_INTERVAL = 0.5          # resend un-acked outgoing Drw packets
-HEART_INTERVAL = 10.0          # app sends dev_control/heart; repeated here
+HEART_INTERVAL = 0             # 0 = off. The app sends heart once; repeating it
+                               # every 10 s coincided with the camera stalling          # app sends dev_control/heart; repeated here
                                # as a stream keep-alive (semantics unconfirmed)
 
 # ---------------------------------------------------------------------------
@@ -135,7 +137,8 @@ CH_CMD = 0
 CH_VIDEO = 1
 CH_AUDIO = 2
 
-JSON_PREAMBLE = bytes.fromhex("060aa080")
+JSON_PREAMBLE = bytes.fromhex("060aa080")   # camera replies may use 06 0a a1 80;
+                                            # only 06 0a is fixed (as in aiopppp)
 
 # JSON command numbers (devbis/aiopppp const.py JsonCommands)
 CMD_SET_CYPUSH = 1
@@ -167,6 +170,7 @@ HELP = """commands (type + Enter while streaming):
   parms                read camera parameters (get_parms)
   alarm                read motion-alarm settings (get_alarm)
   raw {json}           send any JSON command, e.g. raw {"pro":"get_alarm","cmd":107}
+  stream               (re)request the video stream
   reboot               reboot camera
   help"""
 VIDEO_MARKER = b"\x55\xaa\x15\xa8"
@@ -209,8 +213,8 @@ def parse_json_records(payload, keep_partial=False):
     replies are split over several Drw packets on channel 0."""
     out, pos = [], 0
     while pos + 8 <= len(payload):
-        if payload[pos:pos + 4] != JSON_PREAMBLE:
-            nxt = payload.find(JSON_PREAMBLE, pos + 1)
+        if payload[pos:pos + 2] != JSON_PREAMBLE[:2]:
+            nxt = payload.find(JSON_PREAMBLE[:2], pos + 1)
             if nxt < 0:
                 log("skipping non-JSON channel-0 data:", payload[pos:pos + 48].hex())
                 pos = len(payload)
@@ -441,6 +445,10 @@ class Session:
         self.cmd_buf = b""          # partial JSON record spanning Drw packets
         self.awaiting = {}          # cmd -> [[name, send time, reported], ...] (FIFO)
         self.reply_timeout = 3.0
+        self.outq = []
+        self.video_requested_at = 0
+        self.stream_started = 0              # queued command packets (lists of JSON objs)
+        self.last_video = None      # time of the last video packet
         self.console = queue.Queue()
         self.startup_cmds = []      # commands from the command line
 
@@ -539,18 +547,36 @@ class Session:
 
     # --- reliable command channel --------------------------------------
     def send_json(self, *objs):
+        """Queue one command packet (one or more JSON records). Packets go
+        out one at a time: the next only after the camera acked the previous
+        one and answered it (or REPLY_TIMEOUT passed), like aiopppp's
+        send_command/wait_ack/wait_cmd_result. Firing several at once made
+        the camera's command handling stall."""
+        objs = [{**o, "user": USERNAME, "pwd": PASSWORD} for o in objs]
+        self.outq.append(objs)
+        self.pump()
+
+    def busy(self, now):
+        if self.unacked:
+            return True
+        return any(not e[2] and now - e[1] < self.reply_timeout
+                   for entries in self.awaiting.values() for e in entries)
+
+    def pump(self):
+        now = time.time()
+        if not self.outq or self.busy(now):
+            return
+        objs = self.outq.pop(0)
         records = b""
         for o in objs:
-            o = {**o, "user": USERNAME, "pwd": PASSWORD}
             self.requested.add(o.get("cmd"))
-            if o.get("cmd") not in (CMD_SET_DATETIME,):
-                self.awaiting.setdefault(o.get("cmd"), []).append([o.get("pro"), time.time(), False])
+            self.awaiting.setdefault(o.get("cmd"), []).append([o.get("pro"), now, False])
             records += json_record(o)
             log("-> JSON", o)
         idx = self.out_idx
         self.out_idx = (self.out_idx + 1) & 0xffff
         raw = make_drw(CH_CMD, idx, records)
-        self.unacked[idx] = [raw, time.time()]
+        self.unacked[idx] = [raw, now]
         self.send(raw)
 
     def resend_unacked(self, now):
@@ -574,6 +600,8 @@ class Session:
                 name, sent, reported = entry
                 if not reported and now - sent > self.reply_timeout:
                     entry[2] = True
+                    if cmd == CMD_DEV_CONTROL:
+                        continue    # often only acked, never answered
                     print(f"[{time.strftime('%H:%M:%S')}] no reply to '{name}' (cmd {cmd}) "
                           f"within {self.reply_timeout:.0f}s (yet)", flush=True)
             # keep entries a while so a late reply can still be matched
@@ -626,6 +654,7 @@ class Session:
             for obj in records:
                 self.on_json(obj)
         elif ch == CH_VIDEO:
+            self.last_video = time.time()
             if payload.startswith(VIDEO_MARKER) and self.frames < 3:
                 log("frame header:", payload[:VIDEO_HEADER_LEN].hex(),
                     "data:", payload[VIDEO_HEADER_LEN:VIDEO_HEADER_LEN + 16].hex())
@@ -637,7 +666,7 @@ class Session:
 
     def on_json(self, obj):
         cmd = obj.get("cmd")
-        pending = self.awaiting.get(cmd)
+        pending = self.awaiting.get(CMD_SET_DATETIME if cmd == 128 else cmd)
         if pending:
             name, sent, reported = pending.pop(0)
             delay = time.time() - sent
@@ -695,6 +724,8 @@ class Session:
             self.send_json({"pro": "get_alarm", "cmd": CMD_GET_ALARM})
         elif name == "pushhere":
             self.push_to_self()
+        elif name == "stream":
+            self.request_video()
         elif name == "reboot":
             self.control(reboot=1)
         elif name == "raw" and arg:
@@ -735,11 +766,23 @@ class Session:
         self.send_json({"pro": "set_datetime", "cmd": 126,
                         "time": int(time.time()), "tz": time.timezone})
         self.send_json({"pro": "dev_control", "cmd": 102, "heart": 1})
-        self.send_json({"pro": "stream", "cmd": 111, "video": 1, "camsmode": 0},
-                       {"pro": "get_parms", "cmd": 101})
+        # 'stream' is NOT sent here: this camera starts streaming on connect,
+        # and a 'stream' request while video flows stalled its command
+        # handling. The watchdog in run() requests video only if none
+        # arrives (or FORCE_STREAM_CMD is set).
+        if FORCE_STREAM_CMD:
+            self.request_video()
+        self.send_json({"pro": "get_parms", "cmd": 101})
         self.streaming = True
+        self.stream_started = time.time()
         for line in self.startup_cmds:
             self.do_command(line)
+
+    def request_video(self):
+        self.video_requested_at = time.time()
+        self.outq.insert(0, [{"pro": "stream", "cmd": CMD_STREAM, "video": 1,
+                              "camsmode": 0, "user": USERNAME, "pwd": PASSWORD}])
+        self.pump()
 
     def run(self):
         if not self.connect():
@@ -776,10 +819,16 @@ class Session:
                     log("no check_user reply, requesting stream anyway")
                     self.logged_in = True
                     self.start_stream()
-                if (self.streaming and now - last_heart > HEART_INTERVAL
-                        and not self.unacked):     # don't pile up while camera is busy
+                if (HEART_INTERVAL and self.streaming and now - last_heart > HEART_INTERVAL
+                        and not self.outq and not self.busy(now)):
                     self.send_json({"pro": "dev_control", "cmd": 102, "heart": 1})
                     last_heart = now
+                no_video = (now - self.stream_started > 2 if self.last_video is None
+                            else now - self.last_video > 5)
+                if self.streaming and no_video and now - self.video_requested_at > 15:
+                    log("no video -- requesting stream")
+                    self.request_video()
+                self.pump()
         except KeyboardInterrupt:
             pass
         except ConnectionAbortedError as e:
@@ -963,6 +1012,9 @@ def selftest():
     ok &= cs2_decrypt(bytes.fromhex(CAPTURED["punch"])) == make_punch()
     rec = parse_json_records(cs2_decrypt(bytes.fromhex(CAPTURED["check_user"]))[8:])
     ok &= rec and rec[0].get("pro") == "check_user"
+    # camera replies use preamble 06 0a a1 80 (seen on EEE-304142)
+    ok &= parse_json_records(bytes.fromhex("060aa180") + struct.pack("<I", 12)
+                             + b'{"cmd":100}\n\t') == [{"cmd": 100}]
     # JSON record split over two Drw packets
     rec = json_record({"cmd": 107, "x": "y" * 50})
     part1, rest = parse_json_records(rec[:30], keep_partial=True)

@@ -131,3 +131,30 @@ oder fest eingebaut werden können.
 
 Mit `DEBUG_CMD_CHANNEL = True` im Skript wird zusätzlich jedes rohe Paket
 auf dem Befehlskanal geloggt.
+
+## Hänger der Kamera (EEE-304142, Firmware CYCAM_T99_v32_0226)
+
+Beobachtet an der echten Kamera:
+
+* Sie streamt MJPEG **sofort nach dem Verbindungsaufbau**, ohne `stream`-Befehl.
+* Nach einem `stream` (111), während das Video schon läuft, beantwortet sie
+  keine Befehle mehr. Einmal war das nach ~44 s vorbei, einmal hat sie sich
+  ganz aufgehängt (Video stoppt, danach nicht mehr auffindbar). Alle danach
+  gesendeten Befehle (`ir on`, …) wurden deshalb nie ausgeführt.
+* Antworten beginnen mit `06 0a a1 80` statt `06 0a a0 80`. Das alte Skript hat
+  deshalb die Antwort auf `check_user` verworfen.
+
+Änderungen:
+
+* Beim Vorspann werden nur `06 0a` geprüft, wie in aiopppp.
+* Es ist immer nur ein Befehl unterwegs. Der nächste folgt erst, wenn der
+  vorige bestätigt und beantwortet ist oder 3 s vergangen sind (wie aiopppp).
+* `stream` wird nur gesendet, wenn 2 s nach dem Login noch kein Video da ist
+  oder das Video 5 s ausbleibt. Manuell geht es mit `stream`.
+* Kein periodisches `heart` mehr (`HEART_INTERVAL = 0`). Die App sendet es
+  nur einmal.
+
+`icut` beschreibt vermutlich den IR-Sperrfilter: `1` = Filter drin
+(Tagbetrieb, IR-LEDs aus), `0` = Nachtbetrieb. Ob `ir on` die IR-LEDs
+ein- oder ausschaltet, muss an der Kamera geprüft werden. Mit `ir 0`, `ir 1`
+und `ir 2` probieren und jeweils `parms` abfragen.
