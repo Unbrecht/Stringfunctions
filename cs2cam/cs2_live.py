@@ -605,7 +605,7 @@ class Session:
                     print(f"[{time.strftime('%H:%M:%S')}] no reply to '{name}' (cmd {cmd}) "
                           f"within {self.reply_timeout:.0f}s (yet)", flush=True)
             # keep entries a while so a late reply can still be matched
-            entries[:] = [e for e in entries if now - e[1] < 120]
+            entries[:] = [e for e in entries if now - e[1] < 900]
             if not entries:
                 del self.awaiting[cmd]
 
