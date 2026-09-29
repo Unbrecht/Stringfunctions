@@ -162,6 +162,7 @@ PUSH_PORT = 9093            # port the official app configures via set_cypush
 HELP = """commands (type + Enter while streaming):
   led on|off           status LED            (dev_control lamp=1/0)
   ir on|off|toggle     infrared night mode   (dev_control icut=1/0)
+  ir <n>               raw icut value (e.g. 2 -- camera reports isShowIcutAuto)
   light on|off         white light, if any   (set_whiteLight status=1/0)
   parms                read camera parameters (get_parms)
   alarm                read motion-alarm settings (get_alarm)
@@ -418,7 +419,7 @@ class Session:
         self.requested = {CMD_PTZ_CONTROL}
         self.seen_cmd_idx = []      # recent channel-0 idx (camera retransmits)
         self.cmd_buf = b""          # partial JSON record spanning Drw packets
-        self.awaiting = {}          # cmd -> (name, send time) until a reply arrives
+        self.awaiting = {}          # cmd -> [[name, send time, reported], ...] (FIFO)
         self.reply_timeout = 3.0
         self.console = queue.Queue()
         self.startup_cmds = []      # commands from the command line
@@ -464,7 +465,7 @@ class Session:
             o = {**o, "user": USERNAME, "pwd": PASSWORD}
             self.requested.add(o.get("cmd"))
             if o.get("cmd") not in (CMD_SET_DATETIME,):
-                self.awaiting[o.get("cmd")] = (o.get("pro"), time.time())
+                self.awaiting.setdefault(o.get("cmd"), []).append([o.get("pro"), time.time(), False])
             records += json_record(o)
             log("-> JSON", o)
         idx = self.out_idx
@@ -488,14 +489,17 @@ class Session:
                 entry[1] = now
 
     def check_replies(self, now):
-        for cmd, (name, sent) in list(self.awaiting.items()):
-            if now - sent > self.reply_timeout:
+        for cmd, entries in list(self.awaiting.items()):
+            for entry in entries:
+                name, sent, reported = entry
+                if not reported and now - sent > self.reply_timeout:
+                    entry[2] = True
+                    print(f"[{time.strftime('%H:%M:%S')}] no reply to '{name}' (cmd {cmd}) "
+                          f"within {self.reply_timeout:.0f}s (yet)", flush=True)
+            # keep entries a while so a late reply can still be matched
+            entries[:] = [e for e in entries if now - e[1] < 120]
+            if not entries:
                 del self.awaiting[cmd]
-                if cmd == CMD_DEV_CONTROL:
-                    continue    # dev_control is often only acked, not answered
-                print(f"[{time.strftime('%H:%M:%S')}] no reply to '{name}' (cmd {cmd}) "
-                      f"within {self.reply_timeout:.0f}s -- probably not supported "
-                      f"by this camera", flush=True)
 
     def flush_acks(self):
         for ch, idxs in self.pending_acks.items():
@@ -530,10 +534,12 @@ class Session:
     def on_drw(self, ch, idx, payload):
         if ch == CH_CMD:
             if idx in self.seen_cmd_idx:
+                if DEBUG_CMD_CHANNEL:
+                    log(f"ch0 idx={idx} retransmitted by camera (our ack got lost?)")
                 return
             self.seen_cmd_idx = self.seen_cmd_idx[-63:] + [idx]
             if DEBUG_CMD_CHANNEL:
-                log(f"ch0 idx={idx} raw:", payload[:64].hex(), len(payload))
+                log(f"ch0 idx={idx} len={len(payload)} raw:", payload[:64].hex())
             records, self.cmd_buf = parse_json_records(self.cmd_buf + payload, keep_partial=True)
             if len(self.cmd_buf) > 65536:
                 self.cmd_buf = b""
@@ -551,9 +557,13 @@ class Session:
 
     def on_json(self, obj):
         cmd = obj.get("cmd")
-        self.awaiting.pop(cmd, None)
-        if cmd == 128:
-            self.awaiting.pop(CMD_SET_DATETIME, None)
+        pending = self.awaiting.get(cmd)
+        if pending:
+            name, sent, reported = pending.pop(0)
+            delay = time.time() - sent
+            if reported or delay > 2.0:
+                print(f"[{time.strftime('%H:%M:%S')}] late reply to '{name}' after "
+                      f"{delay:.1f}s", flush=True)
         if cmd in self.requested:
             log("<- JSON", obj)
         else:
@@ -591,6 +601,8 @@ class Session:
         on = {"on": True, "1": True, "an": True, "off": False, "0": False, "aus": False}.get(arg)
         if name == "led" and on is not None:
             self.set_led(on)
+        elif name == "ir" and arg.isdigit():
+            self.set_ir(int(arg))           # raw icut value, e.g. to find "auto"
         elif name == "ir" and (on is not None or arg == "toggle"):
             if on is None:
                 on = not self.params.get("icut", 0)
