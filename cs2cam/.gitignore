@@ -2,3 +2,4 @@
 stream_dump.*
 motion_*.jpg
 __pycache__/
+camera_settings.json

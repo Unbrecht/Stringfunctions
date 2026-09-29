@@ -204,3 +204,16 @@ In diesem Lauf war das periodische `heart` abgeschaltet.
   ffplay-Fenster bleibt offen, `--led`, `--ir` und `--rotate` werden erneut
   angewendet.
 * `stream`-Anforderungen stapeln sich nicht mehr in der Warteschlange.
+
+## Einstellungen merken
+
+Das Skript speichert jede mit `led`, `ir`, `rotate`, `light` oder `set`
+gesetzte Einstellung in `camera_settings.json` (neben dem Skript). Nach jedem
+Verbinden und Wiederverbinden sendet es sie automatisch erneut. So bleiben sie
+erhalten, auch wenn die Kamera sie nach einem Neustart oder leerem Akku
+vergisst. Kommandozeilen-Optionen (`--led`, `--ir`, `--rotate`) haben Vorrang.
+
+* `settings` zeigt die gespeicherten Werte, `forget` löscht sie.
+* `--no-restore` startet ohne das erneute Setzen.
+* Ob die Kamera selbst Einstellungen dauerhaft speichert, ist unbekannt.
+  Hinweis darauf: `lamp: 0` war in einer späteren Sitzung noch gesetzt.

@@ -176,6 +176,8 @@ HELP = """commands (type + Enter while streaming):
   parms                read camera parameters (get_parms) -- may block camera ~40 s
   alarm                read motion-alarm settings (get_alarm)
   raw {json}           send any JSON command, e.g. raw {"pro":"get_alarm","cmd":107}
+  settings             show saved settings (re-applied after every connect)
+  forget               clear saved settings
   stream               (re)request the video stream
   reboot               reboot camera
   help"""
@@ -471,6 +473,26 @@ class Player:
 # Session
 # ---------------------------------------------------------------------------
 
+def _settings_file():
+    return os.path.join(OUT_DIR, "camera_settings.json")
+
+
+def load_settings():
+    try:
+        with open(_settings_file()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings):
+    try:
+        with open(_settings_file(), "w") as f:
+            json.dump(settings, f, indent=1, sort_keys=True)
+    except OSError as e:
+        log("could not save settings:", e)
+
+
 def _port_cache():
     return os.path.join(OUT_DIR, ".last_session_port")
 
@@ -514,6 +536,10 @@ class Session:
         self.params = {}            # last get_parms reply
         self.console = queue.Queue()
         self.startup_cmds = []      # commands from the command line
+        # last values set via led/ir/rotate/set/light, re-applied after every
+        # (re)connect so the camera "remembers" them across restarts
+        self.settings = load_settings()
+        self.restore_settings = True
         self._reset_link()
 
     def _reset_link(self):
@@ -807,8 +833,24 @@ class Session:
             print(f"command {JSON_NAMES.get(cmd, cmd)} failed: {obj}", flush=True)
 
     # --- camera controls -----------------------------------------------
-    def control(self, **kw):
+    NOT_REMEMBERED = ("heart", "reboot", "reset")
+
+    def control(self, remember=True, **kw):
         self.send_json({"pro": "dev_control", "cmd": CMD_DEV_CONTROL, **kw})
+        if remember and not any(k in self.NOT_REMEMBERED for k in kw):
+            self.settings.update(kw)
+            save_settings(self.settings)
+
+    def apply_saved_settings(self):
+        if not self.settings:
+            return
+        log("re-applying saved settings:", self.settings)
+        for key, value in self.settings.items():
+            if key == "whiteLight":
+                self.send_json({"pro": "set_whiteLight", "cmd": CMD_SET_WHITELIGHT,
+                                "status": value})
+            else:
+                self.control(remember=False, **{key: value})
 
     def set_led(self, on):
         self.control(lamp=int(on))
@@ -820,6 +862,8 @@ class Session:
 
     def set_whitelight(self, on):
         self.send_json({"pro": "set_whiteLight", "cmd": CMD_SET_WHITELIGHT, "status": int(on)})
+        self.settings["whiteLight"] = int(on)
+        save_settings(self.settings)
 
     def do_command(self, line):
         words = line.strip().split(None, 1)
@@ -851,6 +895,13 @@ class Session:
             self.send_json({"pro": "get_alarm", "cmd": CMD_GET_ALARM})
         elif name == "pushhere":
             self.push_to_self()
+        elif name == "settings":
+            print("saved settings (re-applied after each connect):",
+                  self.settings or "none", flush=True)
+        elif name == "forget":
+            self.settings = {}
+            save_settings(self.settings)
+            print("saved settings cleared", flush=True)
         elif name == "stream":
             self.request_video()
         elif name == "reboot":
@@ -905,7 +956,9 @@ class Session:
         # (ir, led, ...) then sat in the camera's queue unanswered.
         self.streaming = True
         self.stream_started = time.monotonic()
-        for line in self.startup_cmds:
+        if self.restore_settings:
+            self.apply_saved_settings()
+        for line in self.startup_cmds:      # command-line options win
             self.do_command(line)
 
     def request_video(self):
@@ -1190,6 +1243,8 @@ if __name__ == "__main__":
     ap.add_argument("--ir", choices=["on", "off"], help="set infrared mode after login")
     ap.add_argument("--rotate", choices=["0", "1", "2", "3"],
                     help="set image orientation in the camera after login (rotmir)")
+    ap.add_argument("--no-restore", action="store_true",
+                    help="don't re-apply the settings saved in camera_settings.json")
     ap.add_argument("--view-rotate", type=int, choices=[0, 90, 180, 270], default=0,
                     help="rotate only the ffplay display (works regardless of camera support)")
     ap.add_argument("--push-listen", action="store_true",
@@ -1210,6 +1265,7 @@ if __name__ == "__main__":
     if args.rotate:
         session.startup_cmds.append("rotate " + args.rotate)
     VIEW_ROTATE = args.view_rotate
+    session.restore_settings = not args.no_restore
     if args.push_listen:
         start_push_listener(PUSH_PORT)
         session.startup_cmds.append("pushhere")
