@@ -62,6 +62,7 @@ DEVICE_ID = "EEE-304142-PYVFU"
 USERNAME = "admin"
 PASSWORD = "6666"
 DEBUG = True
+DEBUG_CMD_CHANNEL = False      # log every raw channel-0 (command) packet
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 KEEPALIVE_INTERVAL = 1.0       # our own P2PAlive
@@ -201,16 +202,31 @@ def json_record(obj):
     return JSON_PREAMBLE + struct.pack("<I", len(raw)) + raw
 
 
-def parse_json_records(payload):
+def parse_json_records(payload, keep_partial=False):
+    """Returns the JSON records in `payload`. With keep_partial=True returns
+    (records, rest) where `rest` is an incomplete trailing record -- long
+    replies are split over several Drw packets on channel 0."""
     out, pos = [], 0
-    while pos + 8 <= len(payload) and payload[pos:pos + 4] == JSON_PREAMBLE:
+    while pos + 8 <= len(payload):
+        if payload[pos:pos + 4] != JSON_PREAMBLE:
+            nxt = payload.find(JSON_PREAMBLE, pos + 1)
+            if nxt < 0:
+                log("skipping non-JSON channel-0 data:", payload[pos:pos + 48].hex())
+                pos = len(payload)
+                break
+            pos = nxt
+            continue
         n = struct.unpack("<I", payload[pos + 4:pos + 8])[0]
+        if pos + 8 + n > len(payload) and keep_partial:
+            break
         raw = payload[pos + 8:pos + 8 + n]
         pos += 8 + n
         try:
             out.append(json.loads(raw.rstrip(b"\0").decode("utf-8", "replace")))
         except ValueError:
             out.append({"_raw": raw.hex()})
+    if keep_partial:
+        return out, payload[pos:]
     return out
 
 
@@ -401,6 +417,9 @@ class Session:
         # set_datetime (126) is answered as cmd 128 (aiopppp const.py).
         self.requested = {CMD_PTZ_CONTROL}
         self.seen_cmd_idx = []      # recent channel-0 idx (camera retransmits)
+        self.cmd_buf = b""          # partial JSON record spanning Drw packets
+        self.awaiting = {}          # cmd -> (name, send time) until a reply arrives
+        self.reply_timeout = 3.0
         self.console = queue.Queue()
         self.startup_cmds = []      # commands from the command line
 
@@ -444,6 +463,8 @@ class Session:
         for o in objs:
             o = {**o, "user": USERNAME, "pwd": PASSWORD}
             self.requested.add(o.get("cmd"))
+            if o.get("cmd") not in (CMD_SET_DATETIME,):
+                self.awaiting[o.get("cmd")] = (o.get("pro"), time.time())
             records += json_record(o)
             log("-> JSON", o)
         idx = self.out_idx
@@ -453,10 +474,28 @@ class Session:
         self.send(raw)
 
     def resend_unacked(self, now):
-        for idx, entry in self.unacked.items():
+        for idx, entry in list(self.unacked.items()):
             if now - entry[1] > RESEND_INTERVAL:
+                entry.append(now)
+                if len(entry) == 8:     # ~3 s of retries without a DrwAck
+                    log(f"cmd packet idx={idx} still not acked by the camera after "
+                        f"{len(entry) - 2} retries")
+                if len(entry) > 40:
+                    log(f"giving up on cmd packet idx={idx}")
+                    del self.unacked[idx]
+                    continue
                 self.send(entry[0])
                 entry[1] = now
+
+    def check_replies(self, now):
+        for cmd, (name, sent) in list(self.awaiting.items()):
+            if now - sent > self.reply_timeout:
+                del self.awaiting[cmd]
+                if cmd == CMD_DEV_CONTROL:
+                    continue    # dev_control is often only acked, not answered
+                print(f"[{time.strftime('%H:%M:%S')}] no reply to '{name}' (cmd {cmd}) "
+                      f"within {self.reply_timeout:.0f}s -- probably not supported "
+                      f"by this camera", flush=True)
 
     def flush_acks(self):
         for ch, idxs in self.pending_acks.items():
@@ -493,7 +532,12 @@ class Session:
             if idx in self.seen_cmd_idx:
                 return
             self.seen_cmd_idx = self.seen_cmd_idx[-63:] + [idx]
-            for obj in parse_json_records(payload):
+            if DEBUG_CMD_CHANNEL:
+                log(f"ch0 idx={idx} raw:", payload[:64].hex(), len(payload))
+            records, self.cmd_buf = parse_json_records(self.cmd_buf + payload, keep_partial=True)
+            if len(self.cmd_buf) > 65536:
+                self.cmd_buf = b""
+            for obj in records:
                 self.on_json(obj)
         elif ch == CH_VIDEO:
             if payload.startswith(VIDEO_MARKER) and self.frames < 3:
@@ -507,6 +551,9 @@ class Session:
 
     def on_json(self, obj):
         cmd = obj.get("cmd")
+        self.awaiting.pop(cmd, None)
+        if cmd == 128:
+            self.awaiting.pop(CMD_SET_DATETIME, None)
         if cmd in self.requested:
             log("<- JSON", obj)
         else:
@@ -628,6 +675,7 @@ class Session:
 
                 now = time.time()
                 self.resend_unacked(now)
+                self.check_replies(now)
                 if now - last_alive > KEEPALIVE_INTERVAL:
                     self.send(pkt(T_ALIVE))
                     last_alive = now
@@ -703,6 +751,95 @@ def start_push_listener(port):
 
 
 # ---------------------------------------------------------------------------
+# Decode a capture of the official app (PCAPdroid / Wireshark .pcap/.pcapng)
+# ---------------------------------------------------------------------------
+
+def _pcap_packets(path):
+    """Yields (timestamp, ip_payload_bytes) from pcap or pcapng files."""
+    with open(path, "rb") as f:
+        data = f.read()
+    magic = data[:4]
+    if magic == b"\x0a\x0d\x0d\x0a":                  # pcapng
+        pos, linktypes, endian = 0, [], "<"
+        while pos + 12 <= len(data):
+            btype, blen = struct.unpack(endian + "II", data[pos:pos + 8])
+            if btype == 0x0A0D0D0A:
+                endian = "<" if data[pos + 8:pos + 12] == b"\x4d\x3c\x2b\x1a" else ">"
+                btype, blen = struct.unpack(endian + "II", data[pos:pos + 8])
+                linktypes = []
+            elif btype == 1:                              # interface description
+                linktypes.append(struct.unpack(endian + "H", data[pos + 8:pos + 10])[0])
+            elif btype == 6:                              # enhanced packet
+                iface, ts_hi, ts_lo, caplen = struct.unpack(endian + "IIII", data[pos + 8:pos + 24])
+                frame = data[pos + 28:pos + 28 + caplen]
+                lt = linktypes[iface] if iface < len(linktypes) else 1
+                yield ((ts_hi << 32) | ts_lo) / 1e6, _strip_link(lt, frame)
+            if blen < 12:
+                break
+            pos += blen
+        return
+    if magic in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1"):
+        endian = "<"
+    elif magic in (b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d"):
+        endian = ">"
+    else:
+        raise ValueError("not a pcap/pcapng file")
+    nano = magic in (b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d")
+    linktype = struct.unpack(endian + "I", data[20:24])[0]
+    pos = 24
+    while pos + 16 <= len(data):
+        sec, frac, caplen, _ = struct.unpack(endian + "IIII", data[pos:pos + 16])
+        frame = data[pos + 16:pos + 16 + caplen]
+        pos += 16 + caplen
+        yield sec + frac / (1e9 if nano else 1e6), _strip_link(linktype, frame)
+
+
+def _strip_link(linktype, frame):
+    if linktype == 1:                  # Ethernet
+        return frame[14:] if frame[12:14] == b"\x08\x00" else None
+    if linktype == 113:                # Linux cooked
+        return frame[16:]
+    if linktype == 276:                # Linux cooked v2
+        return frame[20:]
+    return frame                       # raw IP (101/228), PCAPdroid default
+
+
+def decode_capture(path, show_video=False):
+    """Prints every PPPP packet in an app capture, decrypted, with the JSON
+    commands in readable form. Use it to learn the exact commands the app
+    sends, e.g. while switching motion detection on/off in the app."""
+    names = {v: k for k, v in globals().items() if k.startswith("T_") and isinstance(v, int)}
+    t0 = None
+    for ts, ip in _pcap_packets(path):
+        if not ip or ip[0] >> 4 != 4 or ip[9] != 17:
+            continue
+        ihl = (ip[0] & 0x0f) * 4
+        src = socket.inet_ntoa(ip[12:16])
+        dst = socket.inet_ntoa(ip[16:20])
+        sport, dport = struct.unpack(">HH", ip[ihl:ihl + 4])
+        payload = ip[ihl + 8:]
+        if not payload:
+            continue
+        dec = cs2_decrypt(payload)
+        if dec[0] != MAGIC:
+            continue
+        t0 = t0 or ts
+        ptype = dec[1]
+        head = f"{ts - t0:8.3f} {src}:{sport} -> {dst}:{dport} {names.get(ptype, hex(ptype))[2:]}"
+        if ptype == T_DRW and len(dec) >= 8:
+            ch, idx = dec[5], struct.unpack(">H", dec[6:8])[0]
+            if ch == CH_CMD:
+                recs = parse_json_records(dec[8:])
+                print(f"{head} ch0 idx={idx}")
+                for r in recs or [{"_raw": dec[8:72].hex()}]:
+                    print("          ", json.dumps(r, ensure_ascii=False))
+            elif show_video:
+                print(f"{head} ch{ch} idx={idx} {len(dec) - 8} bytes")
+        elif ptype not in (T_DRW, T_DRW_ACK, T_ALIVE, T_ALIVE_ACK):
+            print(f"{head} {dec[:24].hex()}")
+
+
+# ---------------------------------------------------------------------------
 # Offline self-test against packets captured from the official app
 # ---------------------------------------------------------------------------
 
@@ -730,6 +867,11 @@ def selftest():
     ok &= cs2_decrypt(bytes.fromhex(CAPTURED["punch"])) == make_punch()
     rec = parse_json_records(cs2_decrypt(bytes.fromhex(CAPTURED["check_user"]))[8:])
     ok &= rec and rec[0].get("pro") == "check_user"
+    # JSON record split over two Drw packets
+    rec = json_record({"cmd": 107, "x": "y" * 50})
+    part1, rest = parse_json_records(rec[:30], keep_partial=True)
+    part2, rest = parse_json_records(rest + rec[30:], keep_partial=True)
+    ok &= part1 == [] and part2 == [{"cmd": 107, "x": "y" * 50}] and rest == b""
     # wrap-around of the 16-bit Drw index
     fa = FrameAssembler()
     seq = [(0xfffe, VIDEO_MARKER + b"\0" * 28 + b"\x00\x00\x00\x01A"),
@@ -743,6 +885,8 @@ def selftest():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--decode", metavar="PCAP",
+                    help="decrypt an app capture (.pcap/.pcapng) and print its JSON commands")
     ap.add_argument("--ip", default=CAMERA_IP)
     ap.add_argument("--led", choices=["on", "off"], help="set status LED after login")
     ap.add_argument("--ir", choices=["on", "off"], help="set infrared mode after login")
@@ -753,6 +897,9 @@ if __name__ == "__main__":
     CAMERA_IP = args.ip
     if args.selftest:
         sys.exit(0 if selftest() else 1)
+    if args.decode:
+        decode_capture(args.decode)
+        sys.exit(0)
     session = Session()
     if args.led:
         session.startup_cmds.append("led " + args.led)

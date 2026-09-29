@@ -96,6 +96,22 @@ Cloud-Push ein, darüber laufen die Alarme. Zwei Wege sind eingebaut:
    App-Benachrichtigungen wiederhergestellt, und dieser Modus muss neu
    aktiviert werden.
 
-Ob Bewegungserkennung eingeschaltet ist, zeigt `alarm`. Die Feldnamen der
-Antwort sind nicht dokumentiert. Zum Ändern die Antwort als Vorlage nehmen und
-mit `raw {"pro":"set_alarm","cmd":108,...}` zurückschicken.
+Ob Bewegungserkennung eingeschaltet ist, sollte `alarm` (`get_alarm`, 107)
+zeigen. **Auf der EEE-304142 antwortet die Kamera darauf nicht.** Das Skript
+meldet das jetzt nach 3 s mit `no reply to 'get_alarm'`. Die Alarm-Befehle
+dieses Modells sind also andere oder haben andere Nummern.
+
+### Echte Befehle aus der App herausfinden
+
+1. PCAPdroid auf dem Handy starten, die Kamera-App öffnen.
+2. In der App die Bewegungserkennung aus- und wieder einschalten, die
+   Empfindlichkeit ändern und die LED- bzw. IR-Einstellung umschalten.
+3. Den Mitschnitt als `.pcap` exportieren und entschlüsseln:
+   `python3 cs2_live.py --decode mitschnitt.pcap`
+
+Der Decoder gibt jeden JSON-Befehl der App und jede Antwort der Kamera im
+Klartext aus. Das sind genau die Befehle, die dann mit `raw {...}` gesendet
+oder fest eingebaut werden können.
+
+Mit `DEBUG_CMD_CHANNEL = True` im Skript wird zusätzlich jedes rohe Paket
+auf dem Befehlskanal geloggt.
