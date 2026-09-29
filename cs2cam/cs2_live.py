@@ -475,16 +475,17 @@ class Session:
         self.send(raw)
 
     def resend_unacked(self, now):
-        for idx, entry in list(self.unacked.items()):
-            if now - entry[1] > RESEND_INTERVAL:
+        """Resend un-acked command packets with backoff (0.5 s .. 2 s).
+        Never give up on one: the camera delivers channel 0 strictly in idx
+        order, so a skipped idx blocks every later command for good."""
+        for idx, entry in self.unacked.items():
+            retries = len(entry) - 2
+            interval = min(RESEND_INTERVAL * (1.5 ** retries), 2.0)
+            if now - entry[1] > interval:
                 entry.append(now)
-                if len(entry) == 8:     # ~3 s of retries without a DrwAck
-                    log(f"cmd packet idx={idx} still not acked by the camera after "
-                        f"{len(entry) - 2} retries")
-                if len(entry) > 40:
-                    log(f"giving up on cmd packet idx={idx}")
-                    del self.unacked[idx]
-                    continue
+                if retries + 1 == 6:
+                    log(f"cmd packet idx={idx} not acked yet -- camera busy, "
+                        f"will keep retrying (later commands queue behind it)")
                 self.send(entry[0])
                 entry[1] = now
 
@@ -696,7 +697,8 @@ class Session:
                     log("no check_user reply, requesting stream anyway")
                     self.logged_in = True
                     self.start_stream()
-                if self.streaming and now - last_heart > HEART_INTERVAL:
+                if (self.streaming and now - last_heart > HEART_INTERVAL
+                        and not self.unacked):     # don't pile up while camera is busy
                     self.send_json({"pro": "dev_control", "cmd": 102, "heart": 1})
                     last_heart = now
         except KeyboardInterrupt:
@@ -755,11 +757,14 @@ def start_push_listener(port):
         s.listen(5)
         while True:
             conn, src = s.accept()
+            print(f"[{time.strftime('%H:%M:%S')}] *** PUSH: camera opened TCP connection "
+                  f"from {src}", flush=True)
             threading.Thread(target=tcp_client, args=(conn, src), daemon=True).start()
 
     for fn in (udp, tcp):
         threading.Thread(target=fn, daemon=True).start()
-    log(f"push listener on tcp/udp port {port}")
+    log(f"push listener on tcp/udp port {port} -- on Windows allow Python through "
+        f"the firewall (private network), otherwise nothing can arrive")
 
 
 # ---------------------------------------------------------------------------

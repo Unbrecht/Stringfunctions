@@ -96,6 +96,22 @@ Cloud-Push ein, darüber laufen die Alarme. Zwei Wege sind eingebaut:
    App-Benachrichtigungen wiederhergestellt, und dieser Modus muss neu
    aktiviert werden.
 
+   Falls nichts ankommt:
+   * Windows-Firewall: Python für „Private Netzwerke“ zulassen, sonst wird
+     Port 9093 blockiert.
+   * Die Antwort auf `set_cypush` prüfen: `<- JSON {'cmd': 1, 'result': 0}`
+     bedeutet, dass die Kamera die Einstellung übernommen hat.
+   * `*** PUSH: camera opened TCP connection` zeigt, ob die Kamera überhaupt
+     Kontakt aufnimmt.
+   * Akkukameras (diese meldet `power`/`charging`) lösen per PIR aus und
+     pushen eventuell nur, wenn gerade niemand streamt. Zum Test den Stream
+     schließen, das Skript mit `--push-listen` aber laufen lassen.
+
+**Wichtig zur Befehlsreihenfolge:** Die Kamera führt Befehle auf Kanal 0
+streng nach idx aus. Ein Paket, das nie ankommt, blockiert alle späteren
+Befehle. Das Skript sendet deshalb unbestätigte Pakete so lange erneut, bis
+die Kamera sie bestätigt, auch wenn sie ~40 s lang beschäftigt ist.
+
 Ob Bewegungserkennung eingeschaltet ist, sollte `alarm` (`get_alarm`, 107)
 zeigen. **Auf der EEE-304142 antwortet die Kamera darauf nicht.** Das Skript
 meldet das jetzt nach 3 s mit `no reply to 'get_alarm'`. Die Alarm-Befehle
