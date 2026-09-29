@@ -596,6 +596,7 @@ class Session:
            it thinks an old session is alive)"""
         punch = cs2_encrypt(make_punch())
         seen_any = False
+        t_start = time.monotonic()
         own_port = self.sock.getsockname()[1]
 
         def listen(seconds):
@@ -617,7 +618,7 @@ class Session:
                     log(f"camera session endpoint: {addr}")
                     self.sock.sendto(punch, addr)
                 if dec[1] == T_P2P_RDY and addr == self.addr:
-                    log("P2P ready")
+                    log(f"P2P ready after {time.monotonic() - t_start:.1f} s")
                     save_port(addr[1])
                     return True
                 if dec[1] == T_CLOSE:
@@ -637,7 +638,8 @@ class Session:
 
         port = load_port()
         if port and not self.addr:
-            log(f"no answer to LAN search, trying last session port {port}")
+            log(f"no answer to LAN search after {time.monotonic() - t_start:.1f} s, "
+                f"trying last session port {port}")
             for _ in range(3):
                 self.sock.sendto(punch, (CAMERA_IP, port))
                 if listen(0.7):
@@ -972,10 +974,19 @@ class Session:
     def reconnect(self):
         """Camera went silent (asleep, crashed, WiFi lost): start over.
         The ffplay window stays open."""
+        if self.addr:
+            # end the old session properly -- if the camera was only briefly
+            # unreachable it would otherwise keep it and ignore our search
+            for _ in range(3):
+                try:
+                    self.send(pkt(T_CLOSE))
+                except OSError:
+                    pass
         while True:
             self._reset_link()
             print(f"[{time.strftime('%H:%M:%S')}] reconnecting ...", flush=True)
             if self.connect():
+                self.last_rx = time.monotonic()
                 self.login()
                 return
             time.sleep(3)
@@ -984,6 +995,7 @@ class Session:
         if not self.connect():
             print("Camera not found. Are you connected to the camera's WiFi?")
             return
+        self.last_rx = time.monotonic()     # count silence from now, not from socket creation
         self.login()
         self.start_console()
         login_sent = last_alive = last_heart = time.monotonic()
